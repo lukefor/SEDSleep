@@ -1,0 +1,53 @@
+[Version]
+Signature = "$Windows NT$"
+Class     = DiskDrive
+ClassGUID = {4d36e967-e325-11ce-bfc1-08002be10318}
+Provider  = %ManufacturerName%
+DriverVer =
+CatalogFile=SEDSleep.cat
+
+;
+; General installation section
+;
+
+[DefaultInstall.NT]
+CopyFiles = @SEDSleep.sys
+Addreg    = SEDSleep.AddReg
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SEDSleep.AddReg]
+HKLM, System\CurrentControlSet\Control\Class\{4d36e967-e325-11ce-bfc1-08002be10318}, UpperFilters, 0x00010008, SEDSleep
+
+
+;
+; Service installation section
+;
+
+[DefaultInstall.NT.Services]
+AddService = SEDSleep, , SEDSleep.Service.Install
+
+[SEDSleep.Service.Install]
+DisplayName    = %SEDSleep.SVCDESC%
+ServiceType    = 1
+StartType      = 0
+ErrorControl   = 1
+ServiceBinary  = %12%\SEDSleep.sys
+LoadOrderGroup = "PnP Filter"
+
+[SourceDisksFiles]
+SEDSleep.sys=1
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+;
+; Localizable Strings
+;
+
+[Strings]
+ManufacturerName="Dark"
+DiskName = "SEDSleep Installation Disk"
+SEDSleep.DeviceDesc = "SEDSleep Device"
+SEDSleep.SVCDESC = "SEDSleep Service"
