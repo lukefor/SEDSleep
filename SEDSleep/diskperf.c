@@ -34,6 +34,12 @@ Notes:
 
 #include "ntstrsafe.h"
 
+
+#include "send3.h"
+#include "send5.h"
+#include "send7.h"
+#include "send9.h"
+
 #ifdef POOL_TAGGING
 #ifdef ExAllocatePool
 #undef ExAllocatePool
@@ -42,6 +48,13 @@ Notes:
 #endif
 
 #define DISKPERF_MAXSTR         64
+
+#define SEDSLEEP_SCSI_BUFFER_SIZE 2048
+
+// big yikes
+#define IOCTL_SCSI_PASS_THROUGH_DIRECT CTL_CODE(FILE_DEVICE_CONTROLLER, 0x0405, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+#define IOCTL_HURR_DURR_IM_A_GOAT      CTL_CODE(FILE_DEVICE_DISK, 0x4628, METHOD_BUFFERED, FILE_READ_DATA)
+
 
 //
 // Device Extension
@@ -84,6 +97,7 @@ typedef struct _DEVICE_EXTENSION {
 
     LONG        EnabledAlways;
 
+
     //
     // Use to keep track of Volume info from ntddvol.h
     //
@@ -114,7 +128,9 @@ typedef struct _DEVICE_EXTENSION {
     UNICODE_STRING PhysicalDeviceName;
     WCHAR PhysicalDeviceNameBuffer[DISKPERF_MAXSTR];
 
-    LONG Sleepy;
+    UCHAR Sleepy;
+
+    UCHAR ScsiBuffer[SEDSLEEP_SCSI_BUFFER_SIZE];
 
 } DEVICE_EXTENSION, * PDEVICE_EXTENSION;
 
@@ -209,6 +225,16 @@ DiskPerfDebugPrint(
 #define DebugPrint(x)
 
 #endif
+
+
+VOID SEDSleepUnlockSetLockingRange(
+    IN PDEVICE_OBJECT DeviceObject
+);
+
+VOID SEDSleepSendSCSICommand(
+    IN PDEVICE_OBJECT DeviceObject
+);
+
 /*
 //
 // Define the sections that allow for discarding (i.e. paging) some of
@@ -891,19 +917,20 @@ DiskPerfDispatchPower(
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
 
+    DebugPrint((0, "POWER HO 0x%p Irp 0x%p %d %d %d\n", DeviceObject, Irp, irpSp->MinorFunction, irpSp->Parameters.Power.Type, irpSp->Parameters.Power.State.SystemState));
     if (irpSp->MinorFunction == IRP_MN_SET_POWER)
     {
         if (irpSp->Parameters.Power.Type == SystemPowerState)
         {
             if (irpSp->Parameters.Power.State.SystemState == PowerSystemSleeping3)
             {
-                DebugPrint((0, "Sleep sleep motherfucker 0x%p Irp 0x%p Sleepy %i\n", DeviceObject, Irp, deviceExtension->Sleepy));
                 deviceExtension->Sleepy = TRUE;
+                DebugPrint((0, "Sleep sleep motherfucker 0x%p Irp 0x%p Sleepy %d\n", DeviceObject, Irp, deviceExtension->Sleepy));
                 KeStallExecutionProcessor(5000000);
             }
         }
     }
-
+    KeStallExecutionProcessor(100000);
 
     // hopefully this is a passthrough or some shit
     IoSkipCurrentIrpStackLocation(Irp);
@@ -1049,7 +1076,7 @@ Return Value:
     PDEVICE_EXTENSION  deviceExtension = DeviceObject->DeviceExtension;
     PIO_STACK_LOCATION currentIrpStack = IoGetCurrentIrpStackLocation(Irp);
     UNREFERENCED_PARAMETER(currentIrpStack);
-    LONG               queueLen;
+    //LONG               queueLen;
     //PLARGE_INTEGER     timeStamp;
     NTSTATUS           status;
 
@@ -1063,7 +1090,7 @@ Return Value:
     //
     status = IoAcquireRemoveLock(&deviceExtension->RemoveLock, Irp);
 
-    DebugPrint((0, "Hello, yes this is dog 0x%p Irp 0x%p\n", DeviceObject, Irp));
+    //DebugPrint((0, "Hello, yes this is dog 0x%p Irp 0x%p\n", DeviceObject, Irp));
 
     if (!NT_SUCCESS(status))
     {
@@ -1084,12 +1111,12 @@ Return Value:
         return (status);
     }
 
-    DebugPrint((0, "woof woof motherfucker 0x%p Irp 0x%p Sleepy %i\n", DeviceObject, Irp, deviceExtension->Sleepy));
+    //DebugPrint((0, "woof woof motherfucker 0x%p Irp 0x%p Sleepy %d\n", DeviceObject, Irp, deviceExtension->Sleepy));
     //
     // Increment queue depth counter.
     //
 
-    queueLen = InterlockedIncrement(&deviceExtension->QueueDepth);
+    //queueLen = InterlockedIncrement(&deviceExtension->QueueDepth);
 
     //
     // Copy current stack to next stack.
@@ -1143,15 +1170,15 @@ Return Value:
     PIO_STACK_LOCATION currentIrpStack = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS    status;
 
-    DebugPrint((2, "DiskPerfDeviceControl: DeviceObject 0x%p Irp 0x%p\n",
-        DeviceObject, Irp));
-
 
     //
     // Acquire the remove lock so that device will not be removed while
     // processing this irp.
     //
     status = IoAcquireRemoveLock(&deviceExtension->RemoveLock, Irp);
+
+    DebugPrint((3, "DiskPerfDeviceControl: DeviceObject 0x%p Irp 0x%p Code %x\n",
+        DeviceObject, Irp, currentIrpStack->Parameters.DeviceIoControl.IoControlCode));
 
     if (!NT_SUCCESS(status))
     {
@@ -1164,43 +1191,10 @@ Return Value:
 
 
     if (currentIrpStack->Parameters.DeviceIoControl.IoControlCode ==
-        IOCTL_DISK_PERFORMANCE) {
+        IOCTL_HURR_DURR_IM_A_GOAT) {
+        
 
-        //NTSTATUS        status;
-
-        //
-        // Verify user buffer is large enough for the performance data.
-        //
-
-        if (currentIrpStack->Parameters.DeviceIoControl.OutputBufferLength <
-            sizeof(DISK_PERFORMANCE)) {
-
-            //
-            // Indicate unsuccessful status and no data transferred.
-            //
-
-            status = STATUS_BUFFER_TOO_SMALL;
-            Irp->IoStatus.Information = 0;
-
-        }
-
-        else {
-            //ULONG i;
-            //PDISK_PERFORMANCE totalCounters;
-           // PDISK_PERFORMANCE diskCounters = deviceExtension->DiskCounters;
-            //LARGE_INTEGER frequency, perfctr;
-
-            //if (diskCounters == NULL) {
-                Irp->IoStatus.Status = STATUS_UNSUCCESSFUL;
-                //
-                // Release the remove lock
-                //
-                IoReleaseRemoveLock(&deviceExtension->RemoveLock, Irp);
-                IoCompleteRequest(Irp, IO_NO_INCREMENT);
-                return STATUS_UNSUCCESSFUL;
-           // }
-
-        }
+        SEDSleepUnlockSetLockingRange(DeviceObject);
 
         //
         // Complete request.
@@ -1686,4 +1680,114 @@ Return Value:
 
 }
 #endif
+/*
+// from some random google search
+#define IfPrint(c) (c >= 32 && c < 127 ? c : '.')
+void HexDump(unsigned char* p_Buffer, unsigned long p_Size)
+{
+    unsigned long l_Index;// , l_Idx;
+    unsigned char l_Row[17];
 
+    for (l_Index = l_Row[16] = 0; l_Index < p_Size || l_Index % 16; ++l_Index)
+    {
+        if (l_Index % 16 == 0) DbgPrint("%05x   ", l_Index);
+        DbgPrint("%02x ", l_Row[l_Index % 16] = (l_Index < p_Size ? p_Buffer[l_Index] : 0));
+        l_Row[l_Index % 16] = IfPrint(l_Row[l_Index % 16]);
+        if ((l_Index + 1) % 16 == 0) DbgPrint("   %s\n", l_Row);
+    }
+
+    DbgPrint("\n");
+}
+*/
+
+void HexDump(unsigned char* Bfr, size_t Count)
+{
+    for (; Count >= 16; Count -= 16, Bfr += 16)
+    {
+        KdPrint((" %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            Bfr[0], Bfr[1], Bfr[2], Bfr[3], Bfr[4], Bfr[5], Bfr[6], Bfr[7],
+            Bfr[8], Bfr[9], Bfr[10], Bfr[11], Bfr[12], Bfr[13], Bfr[14],
+            Bfr[15]
+            ));
+    }
+
+    if (Count)
+    {
+        char sz[80];
+        for (int i = 0; i < Count; i++)
+            sprintf(sz + i * 3, " %02x", Bfr[i]);
+        KdPrint(("%s\n", sz));
+    }
+}
+
+
+VOID SEDSleepUnlockSetLockingRange(
+    IN PDEVICE_OBJECT DeviceObject
+)
+{
+    DebugPrint((0, "Oh boi gonna send me some SCSI commands\n"));
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    memcpy(deviceExtension->ScsiBuffer, send3_bin, send3_bin_len);
+    memset(deviceExtension->ScsiBuffer + send3_bin_len, 0, SEDSLEEP_SCSI_BUFFER_SIZE - send3_bin_len);
+    SEDSleepSendSCSICommand(DeviceObject);
+    memcpy(deviceExtension->ScsiBuffer, send5_bin, send5_bin_len);
+    memset(deviceExtension->ScsiBuffer + send5_bin_len, 0, SEDSLEEP_SCSI_BUFFER_SIZE - send5_bin_len);
+    SEDSleepSendSCSICommand(DeviceObject);
+    USHORT idThing;
+    memcpy(&idThing, deviceExtension->ScsiBuffer + 84, sizeof(idThing));
+    DebugPrint((0, "Got ID thing %x\n", idThing));
+    HexDump(
+        deviceExtension->ScsiBuffer,
+        SEDSLEEP_SCSI_BUFFER_SIZE);
+}
+
+VOID SEDSleepSendSCSICommand(
+    IN PDEVICE_OBJECT DeviceObject
+)
+{
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    
+    IO_STATUS_BLOCK         ioStatus;
+    KEVENT                  event;
+    NTSTATUS status;
+
+    KeInitializeEvent(&event, NotificationEvent, FALSE);
+
+    PFILE_OBJECT driveFile;
+    PDEVICE_OBJECT driveDevice;
+    static UNICODE_STRING driveName = RTL_CONSTANT_STRING(L"\\??\\PhysicalDrive0");
+    //RtlInitUnicodeString(&driveName, L);
+    status = IoGetDeviceObjectPointer(&driveName, FILE_READ_DATA | FILE_WRITE_DATA, &driveFile, &driveDevice);
+
+    if (!NT_SUCCESS(status))
+    {
+        DebugPrint((0, "SEDSleepSendSCSICommand: IoGetDeviceObjectPointer exploded"));
+        return;
+    }
+
+    PIRP irp = IoBuildDeviceIoControlRequest(
+        IOCTL_SCSI_PASS_THROUGH_DIRECT,
+        driveDevice,
+        deviceExtension->ScsiBuffer,
+        SEDSLEEP_SCSI_BUFFER_SIZE,
+        deviceExtension->ScsiBuffer,
+        SEDSLEEP_SCSI_BUFFER_SIZE,
+        TRUE,
+        &event,
+        &ioStatus
+    );
+    if (!irp) {
+        DiskPerfLogError(
+            DeviceObject,
+            256,
+            STATUS_SUCCESS,
+            IO_ERR_INSUFFICIENT_RESOURCES);
+        DebugPrint((0, "SEDSleepSendSCSICommand: Fail to build irp\n"));
+        return;
+    }
+    status = IoCallDriver(driveDevice, irp);
+    if (status == STATUS_PENDING) {
+        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+        status = ioStatus.Status;
+    }
+}

@@ -35,5 +35,17 @@
     <ClInclude Include="Trace.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="send5.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="send7.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="send9.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="send3.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
