@@ -144,6 +144,7 @@ typedef struct _DEVICE_EXTENSION {
     WCHAR PhysicalDeviceNameBuffer[DISKPERF_MAXSTR];
 
     UCHAR Sleepy;
+    KMUTEX SleepMutex;
 
     UCHAR ScsiSendBuffer[SEDSLEEP_SCSI_BUFFER_SIZE];
     UCHAR ScsiRecvBuffer[SEDSLEEP_SCSI_BUFFER_SIZE];
@@ -505,6 +506,8 @@ Return Value:
 
     KeInitializeEvent(&deviceExtension->PagingPathCountEvent,
         NotificationEvent, TRUE);
+
+    KeInitializeMutex(&deviceExtension->SleepMutex, 0);
 
     //
     // default to DO_POWER_PAGABLE
@@ -992,6 +995,8 @@ DiskPerfDispatchPower(
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
 
+
+
     status = DiskPerfForwardIrpSynchronous(DeviceObject, Irp);
 
     if (irpSp->MinorFunction == IRP_MN_SET_POWER)
@@ -1000,7 +1005,17 @@ DiskPerfDispatchPower(
         {
             if (irpSp->Parameters.Power.State.SystemState == PowerSystemWorking)
             {
-                SEDSleepUnlockDrive(DeviceObject);
+                KeWaitForSingleObject(&deviceExtension->SleepMutex, Executive, KernelMode, FALSE, NULL);
+                if (deviceExtension->Sleepy)
+                {
+                    SEDSleepUnlockDrive(DeviceObject);
+                    deviceExtension->Sleepy = FALSE;
+                }
+                KeReleaseMutex(&deviceExtension->SleepMutex, FALSE);
+            }
+            else if (irpSp->Parameters.Power.State.SystemState == PowerSystemSleeping3)
+            {
+                deviceExtension->Sleepy = TRUE;
             }
         }
     }
@@ -1200,8 +1215,20 @@ Return Value:
 
     IoCopyCurrentIrpStackLocationToNext(Irp);
 
-
-    // XXX: THIS IS A COOL PLACE TO HOOK
+    // Block any super early read/write access until the unlocking has completed
+    if (deviceExtension->Sleepy)
+    {
+        do
+        {
+            KeWaitForSingleObject(&deviceExtension->SleepMutex, Executive, KernelMode, FALSE, NULL);
+            if (!deviceExtension->Sleepy)
+            {
+                KeReleaseMutex(&deviceExtension->SleepMutex, FALSE);
+                break;
+            }
+            KeReleaseMutex(&deviceExtension->SleepMutex, FALSE);
+        } while (1);
+    }
 
 
     //
@@ -1756,28 +1783,10 @@ Return Value:
 
 }
 #endif
-/*
-// from some random google search
-#define IfPrint(c) (c >= 32 && c < 127 ? c : '.')
-void HexDump(unsigned char* p_Buffer, unsigned long p_Size)
-{
-    unsigned long l_Index;// , l_Idx;
-    unsigned char l_Row[17];
-
-    for (l_Index = l_Row[16] = 0; l_Index < p_Size || l_Index % 16; ++l_Index)
-    {
-        if (l_Index % 16 == 0) DbgPrint("%05x   ", l_Index);
-        DbgPrint("%02x ", l_Row[l_Index % 16] = (l_Index < p_Size ? p_Buffer[l_Index] : 0));
-        l_Row[l_Index % 16] = IfPrint(l_Row[l_Index % 16]);
-        if ((l_Index + 1) % 16 == 0) DbgPrint("   %s\n", l_Row);
-    }
-
-    DbgPrint("\n");
-}
-*/
 
 void HexDump(unsigned char* Bfr, size_t Count)
 {
+#if DBG
     for (; Count >= 16; Count -= 16, Bfr += 16)
     {
         KdPrint((" %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
@@ -1794,6 +1803,10 @@ void HexDump(unsigned char* Bfr, size_t Count)
             sprintf(sz + i * 3, " %02x", Bfr[i]);
         KdPrint(("%s\n", sz));
     }
+#else
+    UNREFERENCED_PARAMETER(Bfr);
+    UNREFERENCED_PARAMETER(Count);
+#endif
 }
 
 
