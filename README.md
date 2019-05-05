@@ -31,10 +31,9 @@ Building
 To-do
 ===
  - Make the gathering of send5/7/9/7mbr.h less horrendous
- - (or) Receive password via IOCTL
+ - (or) Receive unlock data from usermode
 	 - Avoids needing end users to compile from source 
 	 - Would improve security
-	 - Requires porting a chunk of sedutil (potential license issues..?)
  - Generally tidy up code and remove more of DiskPerf sample code
  - Investigate whether a FOSS license is possible given sample code basis
  - Support SATA drives
