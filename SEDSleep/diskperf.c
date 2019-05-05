@@ -54,8 +54,6 @@ Notes:
 
 #define SEDSLEEP_SCSI_BUFFER_SIZE 2048
 
-// big yikes
-//#define IOCTL_SCSI_PASS_THROUGH_DIRECT CTL_CODE(FILE_DEVICE_CONTROLLER, 0x0405, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define IOCTL_HURR_DURR_IM_A_GOAT      CTL_CODE(FILE_DEVICE_DISK, 0x4628, METHOD_BUFFERED, FILE_READ_DATA)
 
 typedef enum _ATACOMMAND {
@@ -960,7 +958,7 @@ DiskPerfDispatchPower(
     IN PIRP Irp
 )
 {
-    PDEVICE_EXTENSION deviceExtension;
+    /*
 
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
@@ -986,7 +984,35 @@ DiskPerfDispatchPower(
     IoSkipCurrentIrpStackLocation(Irp);
 
 
-    return IoCallDriver(deviceExtension->TargetDeviceObject, Irp);
+    return IoCallDriver(deviceExtension->TargetDeviceObject, Irp);*/
+
+
+    PDEVICE_EXTENSION deviceExtension;
+    NTSTATUS            status;
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+    deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+
+    status = DiskPerfForwardIrpSynchronous(DeviceObject, Irp);
+
+    if (irpSp->MinorFunction == IRP_MN_SET_POWER)
+    {
+        if (irpSp->Parameters.Power.Type == SystemPowerState)
+        {
+            if (irpSp->Parameters.Power.State.SystemState == PowerSystemWorking)
+            {
+                SEDSleepUnlockDrive(DeviceObject);
+            }
+        }
+    }
+
+    //
+    // Complete the Irp
+    //
+    Irp->IoStatus.Status = status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+
+    return status;
+
 
 } // end DiskPerfDispatchPower
 
