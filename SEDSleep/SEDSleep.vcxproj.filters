@@ -32,9 +32,6 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="Trace.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="send5.h">
       <Filter>Header Files</Filter>
     </ClInclude>

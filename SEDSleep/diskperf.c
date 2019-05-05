@@ -1,4 +1,7 @@
 /*++
+
+SEDSleep based on MS DiskPerf example, copyright:
+
 Copyright (C) Microsoft Corporation, 1991 - 1999
 
 Module Name:
@@ -961,41 +964,10 @@ DiskPerfDispatchPower(
     IN PIRP Irp
 )
 {
-    /*
-
-    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
-    deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-    
-    DebugPrint((0, "POWER HO 0x%p Irp 0x%p %d %d %d\n", DeviceObject, Irp, irpSp->MinorFunction, irpSp->Parameters.Power.Type, irpSp->Parameters.Power.State.SystemState));
-    if (irpSp->MinorFunction == IRP_MN_SET_POWER)
-    {
-        if (irpSp->Parameters.Power.Type == SystemPowerState)
-        {
-            //if (irpSp->Parameters.Power.State.SystemState == PowerSystemSleeping3)
-            {
-                deviceExtension->Sleepy = TRUE;
-                DebugPrint((0, "Sleep sleep motherfucker 0x%p Irp 0x%p Sleepy %d\n", DeviceObject, Irp, deviceExtension->Sleepy));
-                //KeStallExecutionProcessor(5000000);
-
-                SEDSleepUnlockDrive(DeviceObject);
-            }
-        }
-    }
-    //KeStallExecutionProcessor(100000);
-
-    // hopefully this is a passthrough or some shit
-    IoSkipCurrentIrpStackLocation(Irp);
-
-
-    return IoCallDriver(deviceExtension->TargetDeviceObject, Irp);*/
-
-
     PDEVICE_EXTENSION deviceExtension;
     NTSTATUS            status;
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-
-
 
     status = DiskPerfForwardIrpSynchronous(DeviceObject, Irp);
 
@@ -1005,6 +977,7 @@ DiskPerfDispatchPower(
         {
             if (irpSp->Parameters.Power.State.SystemState == PowerSystemWorking)
             {
+                // Block read/writes until drive is unlocked via Sleepy, protected by SleepMutex
                 KeWaitForSingleObject(&deviceExtension->SleepMutex, Executive, KernelMode, FALSE, NULL);
                 if (deviceExtension->Sleepy)
                 {
@@ -1015,6 +988,7 @@ DiskPerfDispatchPower(
             }
             else if (irpSp->Parameters.Power.State.SystemState == PowerSystemSleeping3)
             {
+                // Only flag as Sleepy when entering S3, so we don't end up redundantly unlocking the drive and stalling IO
                 deviceExtension->Sleepy = TRUE;
             }
         }
@@ -1181,8 +1155,6 @@ Return Value:
     //
     status = IoAcquireRemoveLock(&deviceExtension->RemoveLock, Irp);
 
-    //DebugPrint((0, "Hello, yes this is dog 0x%p Irp 0x%p\n", DeviceObject, Irp));
-
     if (!NT_SUCCESS(status))
     {
         DebugPrint((3, "DiskPerfReadWrite: Remove lock failed IOCTL Irp type [%x]\n",
@@ -1201,19 +1173,14 @@ Return Value:
         IoReleaseRemoveLock(&deviceExtension->RemoveLock, Irp);
         return (status);
     }
-
-    //DebugPrint((0, "woof woof motherfucker 0x%p Irp 0x%p Sleepy %d\n", DeviceObject, Irp, deviceExtension->Sleepy));
-    //
-    // Increment queue depth counter.
-    //
-
-    //queueLen = InterlockedIncrement(&deviceExtension->QueueDepth);
-
+    
     //
     // Copy current stack to next stack.
     //
 
     IoCopyCurrentIrpStackLocationToNext(Irp);
+
+
 
     // Block any super early read/write access until the unlocking has completed
     if (deviceExtension->Sleepy)
@@ -1814,7 +1781,9 @@ VOID SEDSleepUnlockDrive(
     IN PDEVICE_OBJECT DeviceObject
 )
 {
+    // setlockingrange 0 rw
     SEDSleepSendOPALCommand(DeviceObject, send7_bin, send7_bin_len);
+    // setmbrdone on
     SEDSleepSendOPALCommand(DeviceObject, send7mbr_bin, send7mbr_bin_len);
 }
 

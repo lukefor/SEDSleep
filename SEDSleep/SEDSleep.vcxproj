@@ -221,7 +221,6 @@
     <ClInclude Include="send7.h" />
     <ClInclude Include="send7mbr.h" />
     <ClInclude Include="send9.h" />
-    <ClInclude Include="Trace.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
