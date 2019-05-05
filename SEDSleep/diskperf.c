@@ -24,6 +24,7 @@ Notes:
 #include "ntdddisk.h"
 #include "stdarg.h"
 #include "stdio.h"
+#include "stddef.h"
 #include <ntddvol.h>
 
 #include <mountdev.h>
@@ -33,11 +34,13 @@ Notes:
 #include "wmilib.h"
 
 #include "ntstrsafe.h"
+#include <ntddscsi.h>
+#include "ntintsafe.h"
 
 
-#include "send3.h"
 #include "send5.h"
 #include "send7.h"
+#include "send7mbr.h"
 #include "send9.h"
 
 #ifdef POOL_TAGGING
@@ -52,9 +55,23 @@ Notes:
 #define SEDSLEEP_SCSI_BUFFER_SIZE 2048
 
 // big yikes
-#define IOCTL_SCSI_PASS_THROUGH_DIRECT CTL_CODE(FILE_DEVICE_CONTROLLER, 0x0405, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
+//#define IOCTL_SCSI_PASS_THROUGH_DIRECT CTL_CODE(FILE_DEVICE_CONTROLLER, 0x0405, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define IOCTL_HURR_DURR_IM_A_GOAT      CTL_CODE(FILE_DEVICE_DISK, 0x4628, METHOD_BUFFERED, FILE_READ_DATA)
 
+typedef enum _ATACOMMAND {
+    IF_RECV = 0x5c,
+    IF_SEND = 0x5e,
+    IDENTIFY = 0xec,
+} ATACOMMAND;
+
+//
+// Macro used to convert a ULONG into a 4 byte array (as big-endian)
+//
+#define Get4ByteArrayFromUlong(ULongValue, UCharArray)                                 \
+         ((UNALIGNED UCHAR *)(UCharArray))[3] = ((UNALIGNED UCHAR *)&(ULongValue))[0]; \
+         ((UNALIGNED UCHAR *)(UCharArray))[2] = ((UNALIGNED UCHAR *)&(ULongValue))[1]; \
+         ((UNALIGNED UCHAR *)(UCharArray))[1] = ((UNALIGNED UCHAR *)&(ULongValue))[2]; \
+         ((UNALIGNED UCHAR *)(UCharArray))[0] = ((UNALIGNED UCHAR *)&(ULongValue))[3];
 
 //
 // Device Extension
@@ -130,7 +147,8 @@ typedef struct _DEVICE_EXTENSION {
 
     UCHAR Sleepy;
 
-    UCHAR ScsiBuffer[SEDSLEEP_SCSI_BUFFER_SIZE];
+    UCHAR ScsiSendBuffer[SEDSLEEP_SCSI_BUFFER_SIZE];
+    UCHAR ScsiRecvBuffer[SEDSLEEP_SCSI_BUFFER_SIZE];
 
 } DEVICE_EXTENSION, * PDEVICE_EXTENSION;
 
@@ -227,13 +245,43 @@ DiskPerfDebugPrint(
 #endif
 
 
-VOID SEDSleepUnlockSetLockingRange(
+VOID SEDSleepUnlockDrive(
     IN PDEVICE_OBJECT DeviceObject
 );
 
-VOID SEDSleepSendSCSICommand(
-    IN PDEVICE_OBJECT DeviceObject
+VOID SEDSleepSendOPALCommand(
+    IN PDEVICE_OBJECT DeviceObject,
+    UCHAR* src,
+    size_t len
 );
+
+VOID SEDSleepSendSCSICommand(
+    IN PDEVICE_OBJECT DeviceObject,
+    ATACOMMAND cmd,
+    UCHAR protocol,
+    USHORT comID,
+    const void* src,
+    size_t len
+);
+
+
+_Success_(return != NULL)
+_Post_maybenull_
+_Must_inspect_result_
+__drv_allocatesMem(Mem)
+_Post_writable_byte_size_(*BytesAllocated)
+_When_(((PoolType & 0x1)) != 0, _IRQL_requires_max_(APC_LEVEL))
+_When_(((PoolType & 0x1)) == 0, _IRQL_requires_max_(DISPATCH_LEVEL))
+_When_((PoolType& NonPagedPoolMustSucceed) != 0,
+    __drv_reportError("Must succeed pool allocations are forbidden. "
+        "Allocation failures cause a system crash"))
+    PVOID
+    DsmpAllocateAlignedPool(
+        _In_ IN POOL_TYPE PoolType,
+        _In_ IN SIZE_T NumberOfBytes,
+        _In_ IN ULONG AlignmentMask,
+        _Out_ OUT SIZE_T* BytesAllocated
+    );
 
 /*
 //
@@ -916,21 +964,23 @@ DiskPerfDispatchPower(
 
     PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
     deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-
+    
     DebugPrint((0, "POWER HO 0x%p Irp 0x%p %d %d %d\n", DeviceObject, Irp, irpSp->MinorFunction, irpSp->Parameters.Power.Type, irpSp->Parameters.Power.State.SystemState));
     if (irpSp->MinorFunction == IRP_MN_SET_POWER)
     {
         if (irpSp->Parameters.Power.Type == SystemPowerState)
         {
-            if (irpSp->Parameters.Power.State.SystemState == PowerSystemSleeping3)
+            //if (irpSp->Parameters.Power.State.SystemState == PowerSystemSleeping3)
             {
                 deviceExtension->Sleepy = TRUE;
                 DebugPrint((0, "Sleep sleep motherfucker 0x%p Irp 0x%p Sleepy %d\n", DeviceObject, Irp, deviceExtension->Sleepy));
-                KeStallExecutionProcessor(5000000);
+                //KeStallExecutionProcessor(5000000);
+
+                SEDSleepUnlockDrive(DeviceObject);
             }
         }
     }
-    KeStallExecutionProcessor(100000);
+    //KeStallExecutionProcessor(100000);
 
     // hopefully this is a passthrough or some shit
     IoSkipCurrentIrpStackLocation(Irp);
@@ -1194,7 +1244,7 @@ Return Value:
         IOCTL_HURR_DURR_IM_A_GOAT) {
         
 
-        SEDSleepUnlockSetLockingRange(DeviceObject);
+        SEDSleepUnlockDrive(DeviceObject);
 
         //
         // Complete request.
@@ -1721,38 +1771,126 @@ void HexDump(unsigned char* Bfr, size_t Count)
 }
 
 
-VOID SEDSleepUnlockSetLockingRange(
+VOID SEDSleepUnlockDrive(
     IN PDEVICE_OBJECT DeviceObject
+)
+{
+    SEDSleepSendOPALCommand(DeviceObject, send7_bin, send7_bin_len);
+    SEDSleepSendOPALCommand(DeviceObject, send7mbr_bin, send7mbr_bin_len);
+}
+
+VOID SEDSleepSendOPALCommand(
+    IN PDEVICE_OBJECT DeviceObject,
+    UCHAR* src,
+    size_t len
 )
 {
     DebugPrint((0, "Oh boi gonna send me some SCSI commands\n"));
     PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-    memcpy(deviceExtension->ScsiBuffer, send3_bin, send3_bin_len);
-    memset(deviceExtension->ScsiBuffer + send3_bin_len, 0, SEDSLEEP_SCSI_BUFFER_SIZE - send3_bin_len);
-    SEDSleepSendSCSICommand(DeviceObject);
-    memcpy(deviceExtension->ScsiBuffer, send5_bin, send5_bin_len);
-    memset(deviceExtension->ScsiBuffer + send5_bin_len, 0, SEDSLEEP_SCSI_BUFFER_SIZE - send5_bin_len);
-    SEDSleepSendSCSICommand(DeviceObject);
+    SEDSleepSendSCSICommand(DeviceObject, IF_SEND, 1, 4100, send5_bin, send5_bin_len);
+    SEDSleepSendSCSICommand(DeviceObject, IF_RECV, 1, 4100, NULL, 0);
     USHORT idThing;
-    memcpy(&idThing, deviceExtension->ScsiBuffer + 84, sizeof(idThing));
-    DebugPrint((0, "Got ID thing %x\n", idThing));
+    memcpy(&idThing, deviceExtension->ScsiRecvBuffer + 84, sizeof(idThing));
+    DbgPrint("Got ID thing %x\n", idThing);
+    memcpy(src + 22, &idThing, sizeof(idThing));
+    memcpy(send9_bin + 22, &idThing, sizeof(idThing));
+    SEDSleepSendSCSICommand(DeviceObject, IF_SEND, 1, 4100, src, len);
+    SEDSleepSendSCSICommand(DeviceObject, IF_RECV, 1, 4100, NULL, 0);
+    DebugPrint((0, "Send9...\n"));
+    SEDSleepSendSCSICommand(DeviceObject, IF_SEND, 1, 4100, send9_bin, send9_bin_len);
+    SEDSleepSendSCSICommand(DeviceObject, IF_RECV, 1, 4100, NULL, 0);
     HexDump(
-        deviceExtension->ScsiBuffer,
+        deviceExtension->ScsiRecvBuffer,
         SEDSLEEP_SCSI_BUFFER_SIZE);
 }
 
 VOID SEDSleepSendSCSICommand(
-    IN PDEVICE_OBJECT DeviceObject
+    IN PDEVICE_OBJECT DeviceObject,
+    ATACOMMAND cmd,
+    UCHAR protocol, 
+    USHORT comID,
+    const void* src,
+    size_t len
 )
-{
-    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
-    
+{    
     IO_STATUS_BLOCK         ioStatus;
     KEVENT                  event;
     NTSTATUS status;
+    PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    SIZE_T allocatedLength = 0;
 
-    KeInitializeEvent(&event, NotificationEvent, FALSE);
 
+    // Windows structure with 32-bit sense data
+    typedef struct
+    {
+        SCSI_PASS_THROUGH_DIRECT Sptd;
+        UCHAR sense[32];
+    }
+    SptdStruct;
+
+    SptdStruct sptdS = { 0 };
+
+
+    // initialize SCSI CDB
+    switch (cmd)
+    {
+        default:
+        {
+            DbgPrint("SEDSleepSendSCSICommand: Bad command %x", cmd);
+            return;
+        }
+
+        case IF_RECV:
+        {
+            memset(deviceExtension->ScsiSendBuffer, 0, SEDSLEEP_SCSI_BUFFER_SIZE);
+            len = SEDSLEEP_SCSI_BUFFER_SIZE;
+
+            sptdS.Sptd.Cdb[0] = 0xA2;                                /* Opcode */
+            sptdS.Sptd.Cdb[1] = protocol;                            /* Security Protocol */
+            sptdS.Sptd.Cdb[2] = comID >> 8;                          /* Security Protocol Specific - MSB */
+            sptdS.Sptd.Cdb[3] = comID & 0xFF;                        /* Security Protocol Specific - LSB */
+            sptdS.Sptd.Cdb[4] = 0x80;                                /* INC 512 */
+            sptdS.Sptd.Cdb[6] = (UCHAR)((len / 512) >> 24);             /* Allocation Length - MSB */
+            sptdS.Sptd.Cdb[7] = (UCHAR)(((len / 512) >> 16) & 0xFF);
+            sptdS.Sptd.Cdb[8] = (UCHAR)(((len / 512) >> 8) & 0xFF);
+            sptdS.Sptd.Cdb[9] = (UCHAR)((len / 512) & 0xFF);            /* Allocation Length - LSB */
+            break;
+        }
+
+        case IF_SEND:
+        {
+            memcpy(deviceExtension->ScsiSendBuffer, src, len);
+            memset(deviceExtension->ScsiSendBuffer + len, 0, SEDSLEEP_SCSI_BUFFER_SIZE - len);
+
+            sptdS.Sptd.Cdb[0] = 0xB5;                                /* Opcode */
+            sptdS.Sptd.Cdb[1] = protocol;                            /* Security Protocol */
+            sptdS.Sptd.Cdb[2] = comID >> 8;                          /* Security Protocol Specific - MSB */
+            sptdS.Sptd.Cdb[3] = comID & 0xFF;                        /* Security Protocol Specific - LSB */
+            sptdS.Sptd.Cdb[4] = 0x80;                                /* INC 512 */
+            sptdS.Sptd.Cdb[6] = (UCHAR)((len / 512) >> 24);             /* Transfer Length - MSB */
+            sptdS.Sptd.Cdb[7] = (UCHAR)(((len / 512) >> 16) & 0xFF);
+            sptdS.Sptd.Cdb[8] = (UCHAR)(((len / 512) >> 8) & 0xFF);
+            sptdS.Sptd.Cdb[9] = (UCHAR)((len / 512) & 0xFF);            /* Transfer Length - LSB */
+            break;
+        }
+    }
+
+    PUCHAR dataBuffer = DsmpAllocateAlignedPool(NonPagedPoolNx,
+        len,
+        DeviceObject->AlignmentRequirement,
+        &allocatedLength);
+    memcpy(dataBuffer, deviceExtension->ScsiSendBuffer, len);
+
+    sptdS.Sptd.Length = sizeof(SCSI_PASS_THROUGH_DIRECT);
+    sptdS.Sptd.CdbLength = 12;
+    sptdS.Sptd.DataIn = (cmd == IF_RECV) ? SCSI_IOCTL_DATA_IN : SCSI_IOCTL_DATA_OUT;
+    sptdS.Sptd.SenseInfoLength = sizeof(sptdS.sense);
+    sptdS.Sptd.DataTransferLength = (ULONG)len;
+    sptdS.Sptd.TimeOutValue = 2;
+    sptdS.Sptd.DataBuffer = dataBuffer;
+    sptdS.Sptd.SenseInfoOffset = offsetof(SptdStruct, sense);
+
+#if 0
     PFILE_OBJECT driveFile;
     PDEVICE_OBJECT driveDevice;
     static UNICODE_STRING driveName = RTL_CONSTANT_STRING(L"\\??\\PhysicalDrive0");
@@ -1764,30 +1902,135 @@ VOID SEDSleepSendSCSICommand(
         DebugPrint((0, "SEDSleepSendSCSICommand: IoGetDeviceObjectPointer exploded"));
         return;
     }
+#else
+    PDEVICE_OBJECT driveDevice = deviceExtension->TargetDeviceObject;
+#endif
 
+    //memset(deviceExtension->ScsiRecvBuffer, 0, SEDSLEEP_SCSI_BUFFER_SIZE);
+
+    KeInitializeEvent(&event, SynchronizationEvent, FALSE);
     PIRP irp = IoBuildDeviceIoControlRequest(
         IOCTL_SCSI_PASS_THROUGH_DIRECT,
         driveDevice,
-        deviceExtension->ScsiBuffer,
-        SEDSLEEP_SCSI_BUFFER_SIZE,
-        deviceExtension->ScsiBuffer,
-        SEDSLEEP_SCSI_BUFFER_SIZE,
-        TRUE,
+        &sptdS,
+        sizeof(sptdS),
+        &sptdS,
+        sizeof(sptdS),
+        FALSE,
         &event,
         &ioStatus
     );
-    if (!irp) {
-        DiskPerfLogError(
-            DeviceObject,
-            256,
-            STATUS_SUCCESS,
-            IO_ERR_INSUFFICIENT_RESOURCES);
+    if (!irp) 
+    {
         DebugPrint((0, "SEDSleepSendSCSICommand: Fail to build irp\n"));
         return;
     }
     status = IoCallDriver(driveDevice, irp);
-    if (status == STATUS_PENDING) {
+    if (status == STATUS_PENDING) 
+    {
+        DebugPrint((0, "SEDSleepSendSCSICommand: Pending so we waiting\n"));
         KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+        DebugPrint((0, "SEDSleepSendSCSICommand: Finished waiting\n"));
         status = ioStatus.Status;
     }
+    if (sptdS.Sptd.ScsiStatus != 0 || !NT_SUCCESS(status))
+    {
+        DbgPrint("SEDSleepSendSCSICommand: ScsiStatus was %x, status was %x", sptdS.Sptd.ScsiStatus, status);
+        DbgPrint("SEDSleepSendSCSICommand: CDB:");
+        HexDump(sptdS.Sptd.Cdb, sizeof(sptdS.Sptd.Cdb));
+        DbgPrint("SEDSleepSendSCSICommand: Sense:");
+        HexDump(sptdS.sense, sizeof(sptdS.sense));
+        DbgPrint("SEDSleepSendSCSICommand: Hurr:");
+        HexDump((UCHAR*)(&sptdS), sizeof(sptdS));
+        return;
+    }
+    memcpy(deviceExtension->ScsiRecvBuffer, dataBuffer, len);
+
+    ExFreePool(dataBuffer);
+
+    DebugPrint((0, "SEDSleepSendSCSICommand: It worked I think\n"));
 }
+
+
+
+_Success_(return != NULL)
+_Post_maybenull_
+_Must_inspect_result_
+__drv_allocatesMem(Mem)
+_Post_writable_byte_size_(*BytesAllocated)
+_When_(((PoolType & 0x1)) != 0, _IRQL_requires_max_(APC_LEVEL))
+_When_(((PoolType & 0x1)) == 0, _IRQL_requires_max_(DISPATCH_LEVEL))
+_When_((PoolType& NonPagedPoolMustSucceed) != 0,
+    __drv_reportError("Must succeed pool allocations are forbidden. "
+        "Allocation failures cause a system crash"))
+    PVOID
+#pragma warning(suppress:28195) // Allocation is not guaranteed, caller needs to check return value
+    DsmpAllocateAlignedPool(
+        _In_ IN POOL_TYPE PoolType,
+        _In_ IN SIZE_T NumberOfBytes,
+        _In_ IN ULONG AlignmentMask,
+        _Out_ OUT SIZE_T* BytesAllocated
+    )
+    /*+++
+    Routine Description :
+        Allocates memory from the specified pool using the given tag and alignment requirement.
+        If the allocation is successful, the entire buffer will be zeroed.
+    Arguements:
+        PoolType - Pool to allocate from (NonPaged, Paged, etc)
+        NumberOfBytes - Size of the buffer to allocate
+        AlignmentMask - Alignment requirement specified by the device
+        Tag - Tag (DSM_TAG_XXX) to be used for this allocation.
+              These tags are defined in msdsm.h
+        BytesAllocated - Returns the number of bytes allocated, if the routine was successful
+    Return Value:
+        Pointer to the buffer if allocation is successful
+        NULL otherwise
+    --*/
+{
+    PVOID Block = NULL;
+    UINT_PTR align64 = (UINT_PTR)AlignmentMask;
+    ULONG totalSize = (ULONG)NumberOfBytes;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (BytesAllocated == NULL) {
+
+        status = STATUS_INVALID_PARAMETER;
+        goto __Exit;
+    }
+
+    *BytesAllocated = 0;
+
+    if (AlignmentMask) {
+
+        status = RtlULongAdd((ULONG)NumberOfBytes, AlignmentMask, &totalSize);
+    }
+
+    if (NT_SUCCESS(status)) {
+
+#pragma warning(suppress: 6014 28118) // Block isn't leaked, this function is marked as an allocator; PoolType is simply passed through
+        Block = ExAllocatePool(PoolType, totalSize);
+
+        if (Block != NULL) {
+
+            if (AlignmentMask) {
+
+                Block = (PVOID)(((UINT_PTR)Block + align64) & ~align64);
+            }
+        }
+        else {
+
+            status = STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
+__Exit:
+
+    if (NT_SUCCESS(status)) {
+
+        RtlZeroMemory(Block, totalSize);
+        *BytesAllocated = totalSize;
+    }
+    
+    return Block;
+}
+

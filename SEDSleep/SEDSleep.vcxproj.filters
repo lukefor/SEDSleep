@@ -44,7 +44,7 @@
     <ClInclude Include="send9.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="send3.h">
+    <ClInclude Include="send7mbr.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
