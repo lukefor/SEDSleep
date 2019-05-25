@@ -970,26 +970,46 @@ DiskPerfDispatchPower(
     deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
 
     status = DiskPerfForwardIrpSynchronous(DeviceObject, Irp);
-
-    if (irpSp->MinorFunction == IRP_MN_SET_POWER)
+    if (!NT_SUCCESS(status))
     {
-        if (irpSp->Parameters.Power.Type == SystemPowerState)
+        DebugPrint((3, "DiskPerfDispatchPower: Failed to forward"));
+        Irp->IoStatus.Status = status;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return status;
+    }
+
+    status = IoAcquireRemoveLock(&deviceExtension->RemoveLock, Irp);
+
+    if (!NT_SUCCESS(status))
+    {
+        DebugPrint((3, "DiskPerfDispatchPower: Failed acquire remove"));
+        Irp->IoStatus.Status = status;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return status;
+    }
+
+    //if (deviceExtension->PhysicalDeviceNameBuffer[0] != 0)
+    {
+        if (irpSp->MinorFunction == IRP_MN_SET_POWER)
         {
-            if (irpSp->Parameters.Power.State.SystemState == PowerSystemWorking)
+            if (irpSp->Parameters.Power.Type == SystemPowerState)
             {
-                // Block read/writes until drive is unlocked via Sleepy, protected by SleepMutex
-                KeWaitForSingleObject(&deviceExtension->SleepMutex, Executive, KernelMode, FALSE, NULL);
-                if (deviceExtension->Sleepy)
+                if (irpSp->Parameters.Power.State.SystemState == PowerSystemWorking)
                 {
-                    SEDSleepUnlockDrive(DeviceObject);
-                    deviceExtension->Sleepy = FALSE;
+                    // Block read/writes until drive is unlocked via Sleepy, protected by SleepMutex
+                    KeWaitForSingleObject(&deviceExtension->SleepMutex, Executive, KernelMode, FALSE, NULL);
+                    if (deviceExtension->Sleepy)
+                    {
+                        SEDSleepUnlockDrive(DeviceObject);
+                        deviceExtension->Sleepy = FALSE;
+                    }
+                    KeReleaseMutex(&deviceExtension->SleepMutex, FALSE);
                 }
-                KeReleaseMutex(&deviceExtension->SleepMutex, FALSE);
-            }
-            else if (irpSp->Parameters.Power.State.SystemState == PowerSystemSleeping3)
-            {
-                // Only flag as Sleepy when entering S3, so we don't end up redundantly unlocking the drive and stalling IO
-                deviceExtension->Sleepy = TRUE;
+                else if (irpSp->Parameters.Power.State.SystemState == PowerSystemSleeping3)
+                {
+                    // Only flag as Sleepy when entering S3, so we don't end up redundantly unlocking the drive and stalling IO
+                    deviceExtension->Sleepy = TRUE;
+                }
             }
         }
     }
@@ -999,6 +1019,7 @@ DiskPerfDispatchPower(
     //
     Irp->IoStatus.Status = status;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    IoReleaseRemoveLock(&deviceExtension->RemoveLock, Irp);
 
     return status;
 
@@ -1203,8 +1224,10 @@ Return Value:
     // Return the results of the call to the disk driver.
     //
 
-    return IoCallDriver(deviceExtension->TargetDeviceObject,
+    status = IoCallDriver(deviceExtension->TargetDeviceObject,
         Irp);
+    IoReleaseRemoveLock(&deviceExtension->RemoveLock, Irp);
+    return status;
 
 } // end DiskPerfReadWrite()
 
@@ -1676,6 +1699,8 @@ Return Value:
     // The size of the Log Data Packet cannot be larger than 255 Bytes . 
     //
 
+    DebugPrint((0, "DiskPerfLogError: ERROR DeviceObject 0x%p Err %i\n", DeviceObject, UniqueId));
+
     errorLogEntry = (PIO_ERROR_LOG_PACKET)
         IoAllocateErrorLogEntry(
             DeviceObject,
@@ -1827,6 +1852,8 @@ VOID SEDSleepSendSCSICommand(
     PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeviceObject->DeviceExtension;
     SIZE_T allocatedLength = 0;
 
+    DebugPrint((0, "SEDSleepSendSCSICommand: Device num %x Device name %wZ\n", deviceExtension->DiskNumber,
+        &deviceExtension->PhysicalDeviceName));
 
     // Windows structure with 32-bit sense data
     typedef struct
